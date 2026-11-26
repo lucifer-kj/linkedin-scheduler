@@ -9,9 +9,11 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/linkedin_scheduler?schema=public
       - REDIS_URL=redis://redis:6379
       - ENCRYPTION_MASTER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      - SESSION_SECRET=change-this-to-a-32-plus-char-random-secret-string
       - LINKEDIN_CLIENT_ID=mock_client_id
       - LINKEDIN_CLIENT_SECRET=mock_client_secret
       - LINKEDIN_REDIRECT_URI=http://localhost:3000/api/auth/linkedin/callback
+      - LINKEDIN_API_VERSION=202501
       - USE_MOCK_LINKEDIN=true
       - SIMULATE_TRANSIENT_FAILURE=false
     depends_on:

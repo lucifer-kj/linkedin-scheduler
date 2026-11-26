@@ -1,5 +1,11 @@
 import { ILinkedInClient, LinkedInTokenResponse, LinkedInPublishResult, LinkedInApiError } from './types.js';
-import { logger } from '../logger/index.js';
+import type { LinkedInClientLogger } from './client.js';
+
+const noopLogger: LinkedInClientLogger = {
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
 
 /**
  * Mock LinkedIn API Client
@@ -9,13 +15,35 @@ import { logger } from '../logger/index.js';
 export class MockLinkedInClient implements ILinkedInClient {
   public static simulateTransientFailure = false;
   private static failedAttempts = new Set<string>();
+  private readonly logger: LinkedInClientLogger;
+
+  constructor(logger?: LinkedInClientLogger) {
+    this.logger = logger ?? noopLogger;
+  }
+
+  static setSimulateTransientFailure(enabled: boolean): boolean {
+    MockLinkedInClient.simulateTransientFailure = enabled;
+    if (!enabled) {
+      MockLinkedInClient.failedAttempts.clear();
+    }
+    return MockLinkedInClient.simulateTransientFailure;
+  }
+
+  static toggleSimulateTransientFailure(): boolean {
+    return MockLinkedInClient.setSimulateTransientFailure(!MockLinkedInClient.simulateTransientFailure);
+  }
+
+  static reset(): void {
+    MockLinkedInClient.simulateTransientFailure = false;
+    MockLinkedInClient.failedAttempts.clear();
+  }
 
   getAuthorizationUrl(state: string): string {
     return `/api/auth/linkedin/callback?code=mock_auth_code_12345&state=${state}`;
   }
 
   async exchangeCodeForToken(code: string): Promise<LinkedInTokenResponse> {
-    logger.info({ code }, '[MOCK LINKEDIN] Exchanging authorization code for token');
+    this.logger.info({ code }, '[MOCK LINKEDIN] Exchanging authorization code for token');
     return {
       accessToken: `mock_access_token_${Date.now()}`,
       expiresIn: 5184000, // 60 days in seconds
@@ -26,21 +54,24 @@ export class MockLinkedInClient implements ILinkedInClient {
   }
 
   async publishPost(
-    accessToken: string,
+    _accessToken: string,
     personUrn: string,
     text: string,
     idempotencyKey: string,
     retryAttempt: number = 0
   ): Promise<LinkedInPublishResult> {
-    logger.info(
+    this.logger.info(
       { personUrn, contentLength: text.length, idempotencyKey, retryAttempt },
       '[MOCK LINKEDIN] Publishing post to LinkedIn'
     );
 
-    // Simulate transient failure on the first attempt if test simulation is enabled
-    if (MockLinkedInClient.simulateTransientFailure && retryAttempt === 0 && !MockLinkedInClient.failedAttempts.has(idempotencyKey)) {
+    if (
+      MockLinkedInClient.simulateTransientFailure &&
+      retryAttempt === 0 &&
+      !MockLinkedInClient.failedAttempts.has(idempotencyKey)
+    ) {
       MockLinkedInClient.failedAttempts.add(idempotencyKey);
-      logger.warn(
+      this.logger.warn(
         { idempotencyKey },
         '[MOCK LINKEDIN] Injected transient HTTP 503 (Service Unavailable) to trigger automatic exponential backoff retry.'
       );
@@ -50,11 +81,10 @@ export class MockLinkedInClient implements ILinkedInClient {
       );
     }
 
-    // Simulate standard network latency (150ms)
     await new Promise((resolve) => setTimeout(resolve, 150));
 
     const simulatedPostId = `urn:li:share:mock-${Date.now().toString(36)}`;
-    logger.info({ simulatedPostId }, '[MOCK LINKEDIN] Post published successfully!');
+    this.logger.info({ simulatedPostId }, '[MOCK LINKEDIN] Post published successfully!');
 
     return {
       postUrn: simulatedPostId,

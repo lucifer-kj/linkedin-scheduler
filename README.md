@@ -1,234 +1,140 @@
 # LinkedIn Post Scheduler & Publisher
-> **Technical Assessment Submission: AI / LLM Engineer**  
-> Built with TypeScript, Node.js (Express), BullMQ, Redis, PostgreSQL (Prisma), AES-256-GCM token encryption, and an interactive real-time dashboard.
+
+Full-stack TypeScript application built with **NestJS**, **BullMQ (Redis / Upstash TLS)**, **PostgreSQL (Prisma)**, and **Next.js (static export)** served from a single Render Web Service.
 
 ---
 
-## 1. Architecture & Design
-
-### System Architecture Diagram
+## 1. Architecture Diagram
 
 ```mermaid
 flowchart TD
-    subgraph Client ["Client Layer (Web Dashboard)"]
-        UI["Post Form (Content, Date/Time, Status)"]
-        OAuthBtn["Connect LinkedIn Button"]
-        TestBench["Resilience Test Bench (Toggle 503 Flake)"]
+    subgraph Client ["Next.js Static UI (served by NestJS ServeStaticModule)"]
+        UI["Post Composer, Preview, Status Pipeline & Logs Drawer"]
+        OAuthUI["LinkedIn Connect & Custom OAuth Credentials"]
+        TestBench["503 Failure Simulator"]
     end
 
-    subgraph API ["Backend API (Node.js / TypeScript)"]
-        AuthHandler["OAuth Handler<br/>(AES-256-GCM Token Encryption)"]
-        PostHandler["Post Scheduler Endpoint<br/>(Idempotency Validator)"]
-        QueryHandler["Status & Posts Query Endpoint"]
+    subgraph API ["NestJS Backend (/api/*)"]
+        TenantMW["TenantSessionMiddleware (HMAC-SHA256 li_scheduler_sid)"]
+        AuthCtrl["AuthController (OAuth CSRF State, AES-256-GCM Credentials/Tokens)"]
+        PostsCtrl["PostsController (Schedule, List, Cancel, 503 Toggle)"]
+        HealthCtrl["HealthController (DB + Redis PING + Overdue Recovery)"]
     end
 
-    subgraph Persistence ["Persistence & Distributed Queue"]
-        DB[("PostgreSQL / SQLite<br/>(Encrypted Tokens & State Machine)")]
-        RedisQueue[("Redis Queue<br/>(BullMQ Delayed Jobs)")]
+    subgraph Storage ["PostgreSQL (Supabase) & Redis (Upstash TLS)"]
+        DB[("PostgreSQL (Multi-Tenant User, OAuthCredential, OAuthState, LinkedinAccount, Post)")]
+        Redis[("Redis / BullMQ Delayed Queue")]
     end
 
-    subgraph WorkerLayer ["Resilient Background Worker"]
-        JobConsumer["Scheduler & Queue Consumer"]
-        DedupeGuard{"Duplicate Protection<br/>(Atomic CAS & Mutex Lock)"}
-        DecryptEngine["AES-256-GCM Decryption"]
-        RetryEngine["Exponential Backoff Engine<br/>(Delay = 2s * 2^attempt + jitter)"]
+    subgraph Worker ["BullMQ PostsProcessor (@Processor('linkedin-posts'))"]
+        CAS{"Atomic updateMany CAS (scheduled -> processing)"}
+        Decrypt["AES-256-GCM Decrypt"]
+        Backoff["Exponential Backoff + 429 Retry-After / UnrecoverableError"]
     end
 
-    subgraph External ["External Platform"]
-        LinkedInAPI["LinkedIn REST API<br/>(v2/ugcPosts or Mock Engine)"]
+    subgraph LinkedIn ["LinkedIn API"]
+        RestPosts["POST https://api.linkedin.com/rest/posts (or MockLinkedInClient)"]
     end
 
-    OAuthBtn -->|1. Authorize & Callback| AuthHandler
-    AuthHandler -->|2. Encrypt & Store Token| DB
-    UI -->|3. Submit Post & Scheduled Time| PostHandler
-    PostHandler -->|4. Store status = 'scheduled'| DB
-    PostHandler -->|5. Enqueue delayed job| RedisQueue
-    RedisQueue -->|6. Trigger job when time arrives| JobConsumer
-    JobConsumer -->|7. Verify & Transition to 'processing'| DedupeGuard
-    DedupeGuard -->|8. Decrypt Access Token| DecryptEngine
-    DecryptEngine -->|9. Publish Post| LinkedInAPI
-    LinkedInAPI -->|10a. 201 Created| DB
-    LinkedInAPI -->|10b. 429/503 Temporary Error| RetryEngine
-    RetryEngine -->|11. Re-enqueue with 2^n backoff| RedisQueue
+    UI -->|Same-origin Cookie| TenantMW
+    OAuthUI -->|OAuth 2.0| AuthCtrl
+    TenantMW --> PostsCtrl
+    AuthCtrl --> DB
+    PostsCtrl -->|SHA-256 idempotencyKey| DB
+    PostsCtrl -->|Delayed Job| Redis
+    Redis --> CAS
+    CAS --> Decrypt
+    Decrypt --> RestPosts
+    RestPosts -->|201 x-restli-id| DB
+    RestPosts -->|429 / 5xx| Backoff
+    Backoff --> Redis
+    HealthCtrl -->|Recovery Sweep| Redis
 ```
 
 ---
 
-## 2. Key Engineering Highlights & Requirements Fulfillment
+## 2. Core Guarantees
 
-### 1. LinkedIn OAuth 2.0 & Secure Token Storage
-* **OAuth 2.0 Authorization Code Flow**: Handles authorization redirect, code exchange, and profile URN retrieval (`urn:li:person:...`).
-* **Zero-Trust Encryption (AES-256-GCM)**: Access tokens are **never stored in plaintext**. Every token is encrypted with **AES-256-GCM** using a unique 96-bit Initialization Vector (IV) and a 128-bit authentication tag. Tampered ciphertext or tags immediately fail decryption.
-
-### 2. State Machine Lifecycle
-Every post moves through a deterministic state machine:
-* `scheduled` ➔ Default state upon creation.
-* `processing` ➔ Atomically claimed by the background worker.
-* `published` ➔ Successfully posted to LinkedIn; records `externalPostUrn` and `publishedAt`.
-* `failed` ➔ Terminal failure (e.g. invalid token, expired permissions, or max retries exceeded); records `lastError`.
-
-### 3. Duplicate-Post Protection (Idempotency & Concurrency Guards)
-To guarantee that a post is **never published twice**, the system implements three rings of defense:
-1. **API Ingestion Ring**: A deterministic `idempotencyKey` (`SHA-256(userId + content + scheduledFor)`) enforced by a database `UNIQUE` constraint prevents duplicate form submissions.
-2. **Worker Concurrency Ring**: An atomic Compare-And-Swap (CAS) state transition:
-   ```sql
-   UPDATE posts SET status = 'processing', updated_at = NOW() 
-   WHERE id = :id AND status = 'scheduled';
-   ```
-   If zero rows are modified, another worker already claimed the post, and execution halts immediately.
-3. **In-Flight Memory Mutex**: Local lock prevents worker threads from executing the same post ID simultaneously.
-
-### 4. Automatic Exponential Backoff & Error Classification
-Errors are strictly categorized:
-* **Transient / Retryable Errors (HTTP 429, 500, 502, 503, 504)**:
-  * Automatically retried up to `maxRetries = 5`.
-  * **Exponential Backoff Formula with Random Jitter**:
-    $$\text{Delay} = \min(300\text{s},\, 2\text{s} \times 2^{\text{retryCount}} + \text{random}(0, 500\text{ms}))$$
-  * Status is returned to `scheduled` with the next scheduled timestamp and incremented retry count.
-* **Terminal / Non-Retryable Errors (HTTP 400, 401, 403)**:
-  * Fails immediately and transitions status to `failed` without wasting resources.
-
-### 5. Evaluator "Mock Mode" & Failure Simulator
-* Evaluators do not need an active LinkedIn Developer App to grade this project!
-* When `USE_MOCK_LINKEDIN=true`, the app provides a full mock LinkedIn OAuth and publishing engine.
-* The web dashboard includes an **Evaluator Resilience Test Bench**: toggle the button to simulate a **503 Service Unavailable** on attempt 1, allowing you to watch the automatic retry and exponential backoff happen live in the UI!
+- **Multi-Tenant Session Isolation**: `TenantSessionMiddleware` issues an HMAC-SHA256 signed `HttpOnly` cookie (`li_scheduler_sid`) per browser. Each visitor's OAuth credentials, tokens, and posts are isolated in PostgreSQL without requiring sign-up.
+- **Zero-Trust Token & Credential Storage**: LinkedIn access tokens and optional user-entered `Client ID` / `Client Secret` are encrypted at rest with **AES-256-GCM** (96-bit IV + 128-bit auth tag).
+- **Duplicate-Post Protection**:
+  1. Deterministic `SHA-256(userId + content + scheduledFor)` `idempotencyKey` (`UNIQUE` in PostgreSQL -> `409 Conflict`).
+  2. Atomic `prisma.post.updateMany({ where: { id, status: 'scheduled' }, data: { status: 'processing' } })` Compare-And-Swap claim in `PostsProcessor`.
+  3. BullMQ deterministic `jobId` (`post-${id}`) and job cancellation on `POST /api/posts/:id/cancel`.
+- **Resilient Retries**:
+  - Transient errors (`429` honoring `Retry-After`, `500`–`504`) reset `status = 'scheduled'`, increment `retryCount`, and re-run via BullMQ exponential backoff (`2s * 2^attempt + jitter`).
+  - Terminal errors (`400`, `401`, `403`, expired/undecryptable tokens) mark `status = 'failed'` and throw `UnrecoverableError`.
+- **Render Free-Tier Resilience**: `GET /api/health` checks Postgres `SELECT 1`, Redis `PING`, and runs an overdue-post recovery sweep so an external ping (e.g., `cron-job.org` every 5–10 min) keeps the worker awake and recovers missed jobs.
 
 ---
 
-## 3. Database Schema
+## 3. PostgreSQL Database Schema
 
-```sql
--- Post State Machine
-CREATE TABLE "User" (
-    "id" TEXT PRIMARY KEY,
-    "email" TEXT UNIQUE NOT NULL,
-    "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE "LinkedinAccount" (
-    "id" TEXT PRIMARY KEY,
-    "userId" TEXT UNIQUE NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
-    "linkedinPersonUrn" TEXT NOT NULL,
-    "linkedinName" TEXT NOT NULL,
-    "encryptedAccessToken" TEXT NOT NULL,
-    "tokenIv" TEXT NOT NULL,
-    "tokenAuthTag" TEXT NOT NULL,
-    "expiresAt" TIMESTAMP NOT NULL,
-    "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE "Post" (
-    "id" TEXT PRIMARY KEY,
-    "userId" TEXT NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
-    "linkedinAccountId" TEXT NOT NULL REFERENCES "LinkedinAccount"("id"),
-    "content" TEXT NOT NULL,
-    "scheduledFor" TIMESTAMP NOT NULL,
-    "status" TEXT DEFAULT 'scheduled' NOT NULL, -- 'scheduled' | 'processing' | 'published' | 'failed'
-    "idempotencyKey" TEXT UNIQUE NOT NULL,
-    "retryCount" INTEGER DEFAULT 0 NOT NULL,
-    "maxRetries" INTEGER DEFAULT 5 NOT NULL,
-    "lastError" TEXT,
-    "externalPostUrn" TEXT,
-    "publishedAt" TIMESTAMP,
-    "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX "idx_post_status_scheduled" ON "Post"("status", "scheduledFor");
-```
+Defined in [`prisma/schema.prisma`](prisma/schema.prisma):
+- `User` (`id`, `sessionId` unique)
+- `OAuthCredential` (`userId` unique, AES-256-GCM encrypted `clientId` & `clientSecret`)
+- `OAuthState` (`state` PK, `userId`, `expiresAt` — single-use CSRF state)
+- `LinkedinAccount` (`userId` unique, `linkedinPersonUrn`, `linkedinName`, AES-256-GCM encrypted `accessToken`, `expiresAt`)
+- `Post` (`id`, `userId`, `linkedinAccountId`, `content`, `scheduledFor`, `status`, `idempotencyKey` unique, `bullmqJobId`, `retryCount`, `maxRetries`, `lastError`, `externalPostUrn`, `publishedAt`)
 
 ---
 
-## 4. Setup & Running Instructions
-
-### Option A: Zero-Config Local Run (Recommended for Instant Grading)
-
-Requirements: Node.js 18+ and `pnpm`.
+## 4. Local Setup & Verification
 
 ```bash
-# 1. Install dependencies
+# 1. Install dependencies (pnpm only)
 pnpm install
 
-# 2. Initialize database schema
-pnpm db:push
+# 2. Configure environment
+cp .env.example .env
+# Set DATABASE_URL (PostgreSQL), REDIS_URL, ENCRYPTION_MASTER_KEY (64 hex), SESSION_SECRET (32+ chars)
 
-# 3. Run unit & integration tests
+# 3. Push schema & run tests
+pnpm db:push
 pnpm test
 
-# 4. Start the application
-pnpm dev
+# 4. Build NestJS + Next.js static export
+pnpm build
+pnpm start
 ```
 
-Open your browser to: **`http://localhost:3000`**
-
----
-
-### Option B: Run with Docker Compose (PostgreSQL + Redis + App)
-
-Requirements: Docker & Docker Compose.
-
+Or run everything locally with Docker Compose (Postgres 16 + Redis 7 + App):
 ```bash
-# 1. Start all containers (Postgres, Redis, and App)
-docker-compose up --build
+docker compose up --build
 ```
 
-Access the dashboard at **`http://localhost:3000`**.
+Run the deployment debugger / smoke suite against local or live URL:
+```bash
+pnpm smoke -- --url http://localhost:3000
+```
 
 ---
 
-## 5. Live Demonstration & Verification Walkthrough
+## 5. Live Deployment Guide (Render Free Tier + Supabase + Upstash)
 
-1. **Connect Account**: Open `http://localhost:3000` and click **"Connect LinkedIn Account"**. The OAuth flow completes instantly in Mock Mode, generating an AES-256-GCM encrypted token.
-2. **Normal Scheduling**:
-   * Type post content into the box.
-   * Click **"+15s (Quick Test)"** to schedule the post 15 seconds into the future.
-   * Click **"Schedule Post"**.
-   * Observe the status badge: it starts as **⏱ Scheduled**, transitions to **⚙ Processing**, and flips to **✓ Published** with a generated LinkedIn URN.
-3. **Resilience & Retry Verification**:
-   * In the **"🧪 Evaluator Resilience Test Bench"** card, click the toggle to turn **Simulate 503 Service Unavailable: ON**.
-   * Schedule a new post for +15s.
-   * Watch the live queue: on attempt 1, the post catches the 503, records the error notice, increments `Retry: 1/5`, calculates the exponential delay, and re-schedules itself.
-   * On attempt 2, it publishes successfully!
-4. **Duplicate Protection Verification**:
-   * Attempting to schedule identical content for the exact same timestamp is blocked with a 409 Conflict.
-   * Concurrency locks prevent worker races.
+### Step 1: Supabase PostgreSQL (Free Tier)
+1. Create a free project in Supabase and copy the **Connection String** (Transaction/Session pooler or Direct URI with `?sslmode=require`).
+2. Save it as `DATABASE_URL`.
 
----
+### Step 2: Upstash Redis (Free Tier)
+1. Create a free Redis database in [Upstash](https://upstash.com).
+2. Copy the `rediss://default:<password>@<host>:<port>` TLS URL and save it as `REDIS_URL`.
 
-## 6. Project Structure
+### Step 3: LinkedIn Developer App
+1. Open the [LinkedIn Developer Portal](https://developer.linkedin.com) and create an app linked to a LinkedIn Page.
+2. Under **Products**, enable **Share on LinkedIn** (`w_member_social`) and **Sign In with LinkedIn using OpenID Connect** (`openid`, `profile`, `email`).
+3. Under **Auth -> Authorized redirect URLs**, add:
+   `https://<your-render-service>.onrender.com/api/auth/linkedin/callback`
+4. Copy **Client ID** and **Client Secret**.
 
-```text
-linkedin-scheduler/
-├── src/
-│   ├── api/
-│   │   └── routes.ts             # Express endpoints (OAuth, scheduling, status)
-│   ├── config/
-│   │   └── index.ts              # Zod environment variable parsing & validation
-│   ├── crypto/
-│   │   ├── encryption.ts         # AES-256-GCM authenticated token encryption
-│   │   └── encryption.test.ts    # Cryptographic unit tests
-│   ├── database/
-│   │   └── client.ts             # Prisma client singleton
-│   ├── linkedin/
-│   │   ├── types.ts              # LinkedIn client contracts & error models
-│   │   ├── client.ts             # Production LinkedIn REST API client
-│   │   ├── mock-client.ts        # Mock client with 503 transient failure injection
-│   │   └── index.ts              # Client selector (Live vs Mock)
-│   ├── logger/
-│   │   └── index.ts              # Structured logging (Pino)
-│   ├── public/
-│   │   └── index.html            # Real-time dashboard with auto-polling & test bench
-│   ├── queue/
-│   │   ├── scheduler.ts          # BullMQ & atomic DB polling scheduler
-│   │   └── worker.ts             # Concurrency guards, state machine, & retries
-│   └── server.ts                 # Express server & graceful shutdown lifecycle
-├── tests/
-│   └── worker.test.ts            # Integration tests (publishing, deduplication, 503 backoff)
-├── prisma/
-│   └── schema.prisma             # Database schema
-├── docker-compose.yml            # Docker setup (Postgres + Redis + App)
-├── Dockerfile                    # Multi-stage production container build
-├── package.json
-└── README.md
-```
+### Step 4: Deploy to Render
+1. Push this repository to GitHub.
+2. In Render, create a **New Blueprint** (uses `render.yaml`) or **Web Service** from your repo.
+3. Set the remaining environment variables (`DATABASE_URL`, `REDIS_URL`, `ENCRYPTION_MASTER_KEY` 64-hex chars, `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `LINKEDIN_REDIRECT_URI`, `USE_MOCK_LINKEDIN=false`).
+4. Once live, verify with the deployment debugger:
+   ```bash
+   pnpm smoke -- --url https://<your-render-service>.onrender.com
+   ```
+
+### Step 5: Prevent Render Free-Tier Sleep
+Create a free monitor on [cron-job.org](https://cron-job.org) or UptimeRobot hitting `GET https://<your-render-service>.onrender.com/api/health` every 5–10 minutes.

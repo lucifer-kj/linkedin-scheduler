@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: linkedin-scheduler
+    runtime: node
+    plan: free
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm db:generate && pnpm build
+    startCommand: pnpm db:push && node dist/main.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: USE_MOCK_LINKEDIN
+        value: "false"
+      - key: LINKEDIN_API_VERSION
+        value: "202501"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ENCRYPTION_MASTER_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: LINKEDIN_CLIENT_ID
+        sync: false
+      - key: LINKEDIN_CLIENT_SECRET
+        sync: false
+      - key: LINKEDIN_REDIRECT_URI
+        sync: false
