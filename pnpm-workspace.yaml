@@ -1,0 +1,11 @@
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: true
+permissions:
+  '@prisma/client':
+    build: true
+  '@prisma/engines':
+    build: true
+  prisma:
+    build: true
+    skills: true

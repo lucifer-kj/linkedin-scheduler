@@ -1,0 +1,59 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id              String           @id @default(uuid())
+  email           String           @unique
+  linkedinAccount LinkedinAccount?
+  posts           Post[]
+  createdAt       DateTime         @default(now())
+}
+
+model LinkedinAccount {
+  id                   String   @id @default(uuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  linkedinPersonUrn    String   // urn:li:person:XXXX
+  linkedinName         String   @default("LinkedIn User")
+  encryptedAccessToken String
+  tokenIv              String
+  tokenAuthTag         String
+  expiresAt            DateTime
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  posts                Post[]
+}
+
+model Post {
+  id                String          @id @default(uuid())
+  userId            String
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  linkedinAccountId String
+  linkedinAccount   LinkedinAccount @relation(fields: [linkedinAccountId], references: [id])
+  
+  content           String
+  scheduledFor      DateTime
+  // Status: scheduled, processing, published, failed
+  status            String          @default("scheduled")
+  
+  // Concurrency & Duplicate Protection
+  idempotencyKey    String          @unique
+  retryCount        Int             @default(0)
+  maxRetries        Int             @default(5)
+  lastError         String?
+  
+  // Results
+  externalPostUrn   String?         // Returned by LinkedIn upon 201 Created
+  publishedAt       DateTime?
+  
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([status, scheduledFor])
+}
